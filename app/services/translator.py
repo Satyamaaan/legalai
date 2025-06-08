@@ -1,470 +1,462 @@
 """
-Sarvam AI Translation Service.
+Translation service for the Legal Document Translator.
 
-This module provides functionality to translate text using the Sarvam AI API,
-with special handling for HTML structure preservation, chunking for API limits,
-and robust error handling.
+This service handles translation using Sarvam AI's translation API,
+with intelligent text chunking, retry logic, and error handling.
 """
 
-import os
-import re
 import time
-import json
 import logging
-import html
-from typing import Dict, List, Optional, Union, Tuple, Callable, Any
-from dataclasses import dataclass
 import requests
-from bs4 import BeautifulSoup
+from typing import Dict, List, Optional, Any, Tuple, Callable
+from dataclasses import dataclass
+from enum import Enum
 
-from app.services.extractor import PageText, ExtractionResult
-
-# Configure logger
 logger = logging.getLogger(__name__)
 
-# Constants
-DEFAULT_MAX_CHARS = 1000  # Sarvam API character limit per request
-DEFAULT_RETRY_COUNT = 3
-DEFAULT_RETRY_DELAY = 1.0  # seconds
-DEFAULT_RATE_LIMIT_DELAY = 0.5  # seconds between API calls
-HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
-
 class TranslationError(Exception):
-    """Base exception for translation errors."""
+    """Custom exception for translation errors."""
     pass
 
+class LanguageCode(Enum):
+    """Supported language codes."""
+    GUJARATI = "gu"
+    ENGLISH = "en"
+    HINDI = "hi"
+
 @dataclass
-class TranslatedPage:
-    """
-    Represents a translated page with metadata.
-    """
-    page_number: int
-    original_text: str
-    translated_text: str
-    html_translated: str
+class TranslationRequest:
+    """Data class for translation request."""
+    text: str
     source_language: str
     target_language: str
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary representation."""
-        return {
-            "page_number": self.page_number,
-            "original_text": self.original_text,
-            "translated_text": self.translated_text,
-            "html_translated": self.html_translated,
-            "source_language": self.source_language,
-            "target_language": self.target_language
-        }
+    chunk_id: Optional[int] = None
 
 @dataclass
 class TranslationResult:
-    """
-    Represents the complete result of a document translation.
-    """
-    pages: List[TranslatedPage]
-    success: bool
+    """Data class for translation result."""
+    original_text: str
+    translated_text: str
     source_language: str
     target_language: str
-    total_pages: int
-    error: Optional[str] = None
-    
-    @property
-    def full_translated_text(self) -> str:
-        """Get the full translated text of all pages concatenated."""
-        return "\n\n".join(page.translated_text for page in self.pages)
-    
-    @property
-    def full_html_translated(self) -> str:
-        """Get the full HTML translated content of all pages."""
-        return "\n\n".join(page.html_translated for page in self.pages)
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary representation."""
-        return {
-            "pages": [page.to_dict() for page in self.pages],
-            "success": self.success,
-            "source_language": self.source_language,
-            "target_language": self.target_language,
-            "total_pages": self.total_pages,
-            "error": self.error
-        }
+    chunk_id: Optional[int] = None
+    confidence: Optional[float] = None
+    processing_time: Optional[float] = None
 
 class SarvamTranslator:
     """
-    Client for the Sarvam AI Translation API with robust error handling,
-    rate limiting, and HTML structure preservation.
+    Translation service using Sarvam AI API.
+    
+    Handles chunking, rate limiting, retries, and error recovery.
     """
     
     def __init__(
-        self,
-        api_key: str,
+        self, 
+        api_key: str, 
         api_url: str = "https://api.sarvam.ai/v1",
-        max_chars: int = DEFAULT_MAX_CHARS,
-        retry_count: int = DEFAULT_RETRY_COUNT,
-        retry_delay: float = DEFAULT_RETRY_DELAY,
-        rate_limit_delay: float = DEFAULT_RATE_LIMIT_DELAY
+        max_chars_per_request: int = 1000,
+        max_retries: int = 3,
+        retry_delay: float = 1.0
     ):
         """
-        Initialize the Sarvam Translator.
+        Initialize the translator.
         
         Args:
-            api_key: Sarvam AI API key
-            api_url: Base URL for the Sarvam API
-            max_chars: Maximum characters per translation request
-            retry_count: Maximum number of retries for failed requests
-            retry_delay: Initial delay between retries (seconds)
-            rate_limit_delay: Delay between API calls to avoid rate limiting
+            api_key (str): Sarvam AI API key
+            api_url (str): Base URL for Sarvam API
+            max_chars_per_request (int): Maximum characters per API call
+            max_retries (int): Maximum retry attempts
+            retry_delay (float): Initial delay between retries (seconds)
         """
         self.api_key = api_key
         self.api_url = api_url.rstrip('/')
-        self.max_chars = max_chars
-        self.retry_count = retry_count
+        self.max_chars = max_chars_per_request
+        self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.rate_limit_delay = rate_limit_delay
-        self.last_request_time = 0
         
-        # Validate API key
-        if not api_key:
-            raise TranslationError("Sarvam API key is required")
+        # Request session for connection pooling
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json'
+        })
+        
+        # Translation endpoint
+        self.translate_endpoint = f"{self.api_url}/translate"
+        
+        logger.info(f"SarvamTranslator initialized with endpoint: {self.translate_endpoint}")
     
     def translate_text(
-        self,
-        text: str,
-        source_language: str,
-        target_language: str
-    ) -> str:
-        """
-        Translate a single text string using the Sarvam API.
-        
-        Args:
-            text: Text to translate
-            source_language: Source language code (e.g., "gu" for Gujarati)
-            target_language: Target language code (e.g., "en" for English)
-            
-        Returns:
-            Translated text
-            
-        Raises:
-            TranslationError: If translation fails after retries
-        """
-        if not text.strip():
-            return ""
-        
-        # Respect rate limiting
-        self._respect_rate_limit()
-        
-        endpoint = f"{self.api_url}/translate"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        payload = {
-            "text": text,
-            "source_language": source_language,
-            "target_language": target_language
-        }
-        
-        # Track request time for rate limiting
-        self.last_request_time = time.time()
-        
-        # Implement retry logic
-        for attempt in range(self.retry_count):
-            try:
-                response = requests.post(endpoint, headers=headers, json=payload, timeout=30)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    return result.get("translated_text", "")
-                elif response.status_code == 429:  # Rate limited
-                    wait_time = int(response.headers.get("Retry-After", self.retry_delay * (2 ** attempt)))
-                    logger.warning(f"Rate limited by Sarvam API. Waiting {wait_time} seconds.")
-                    time.sleep(wait_time)
-                else:
-                    error_msg = f"Sarvam API error: {response.status_code} - {response.text}"
-                    logger.error(error_msg)
-                    
-                    # Wait before retry with exponential backoff
-                    if attempt < self.retry_count - 1:
-                        wait_time = self.retry_delay * (2 ** attempt)
-                        logger.info(f"Retrying in {wait_time:.2f} seconds (attempt {attempt + 1}/{self.retry_count})")
-                        time.sleep(wait_time)
-            
-            except requests.RequestException as e:
-                logger.error(f"Request error: {str(e)}")
-                
-                # Wait before retry with exponential backoff
-                if attempt < self.retry_count - 1:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    logger.info(f"Retrying in {wait_time:.2f} seconds (attempt {attempt + 1}/{self.retry_count})")
-                    time.sleep(wait_time)
-        
-        # If we get here, all retries failed
-        raise TranslationError(f"Translation failed after {self.retry_count} attempts")
-    
-    def _respect_rate_limit(self):
-        """
-        Ensure we don't exceed rate limits by adding delays between requests.
-        """
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.rate_limit_delay:
-            time.sleep(self.rate_limit_delay - elapsed)
-    
-    def translate_html(
-        self,
-        html_content: str,
-        source_language: str,
-        target_language: str
-    ) -> str:
-        """
-        Translate HTML content while preserving tags and structure.
-        
-        Args:
-            html_content: HTML content to translate
-            source_language: Source language code
-            target_language: Target language code
-            
-        Returns:
-            Translated HTML content
-        """
-        # Split HTML into chunks that respect tag boundaries
-        chunks = self._chunk_html(html_content, self.max_chars)
-        
-        # Translate each chunk
-        translated_chunks = []
-        for chunk in chunks:
-            translated_chunk = self.translate_text(chunk, source_language, target_language)
-            translated_chunks.append(translated_chunk)
-        
-        # Reassemble chunks
-        return "".join(translated_chunks)
-    
-    def _chunk_html(self, html_content: str, max_chars: int) -> List[str]:
-        """
-        Split HTML content into chunks respecting tag boundaries.
-        
-        Args:
-            html_content: HTML content to chunk
-            max_chars: Maximum characters per chunk
-            
-        Returns:
-            List of HTML chunks
-        """
-        if len(html_content) <= max_chars:
-            return [html_content]
-        
-        soup = BeautifulSoup(html_content, 'html.parser')
-        chunks = []
-        current_chunk = ""
-        
-        # Process each top-level element
-        for element in soup.body.children if soup.body else soup.children:
-            element_str = str(element)
-            
-            # If adding this element would exceed max_chars, start a new chunk
-            if len(current_chunk) + len(element_str) > max_chars and current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = ""
-            
-            # If the element itself is larger than max_chars, we need to split it
-            if len(element_str) > max_chars:
-                # For large text nodes, split by sentences or phrases
-                if element.name is None:  # Text node
-                    sentences = re.split(r'([.!?।][\s\n])', str(element))
-                    for i in range(0, len(sentences), 2):
-                        sentence = sentences[i]
-                        if i + 1 < len(sentences):
-                            sentence += sentences[i + 1]  # Add the delimiter back
-                        
-                        if len(current_chunk) + len(sentence) > max_chars and current_chunk:
-                            chunks.append(current_chunk)
-                            current_chunk = ""
-                        
-                        current_chunk += sentence
-                        
-                        if len(current_chunk) > max_chars:
-                            chunks.append(current_chunk)
-                            current_chunk = ""
-                else:
-                    # For large elements, recursively chunk their contents
-                    sub_chunks = self._chunk_html(element_str, max_chars)
-                    
-                    # Add first sub-chunk to current chunk if it fits
-                    if sub_chunks and len(current_chunk) + len(sub_chunks[0]) <= max_chars:
-                        current_chunk += sub_chunks[0]
-                        sub_chunks = sub_chunks[1:]
-                    
-                    # Finalize current chunk if it's not empty
-                    if current_chunk:
-                        chunks.append(current_chunk)
-                        current_chunk = ""
-                    
-                    # Add remaining sub-chunks
-                    chunks.extend(sub_chunks)
-            else:
-                current_chunk += element_str
-                
-                # If current chunk is getting too large, finalize it
-                if len(current_chunk) > max_chars * 0.9:
-                    chunks.append(current_chunk)
-                    current_chunk = ""
-        
-        # Add the last chunk if not empty
-        if current_chunk:
-            chunks.append(current_chunk)
-        
-        return chunks
-    
-    def translate_extraction_result(
-        self,
-        extraction_result: ExtractionResult,
-        source_language: str,
-        target_language: str,
-        progress_callback: Optional[Callable[[int, int, str], None]] = None
+        self, 
+        text: str, 
+        source_lang: str = "gu", 
+        target_lang: str = "en",
+        preserve_formatting: bool = True
     ) -> TranslationResult:
         """
-        Translate an entire extraction result while preserving structure.
+        Translate a single text chunk.
         
         Args:
-            extraction_result: ExtractionResult from the extractor service
-            source_language: Source language code
-            target_language: Target language code
-            progress_callback: Optional callback for progress updates
+            text (str): Text to translate
+            source_lang (str): Source language code
+            target_lang (str): Target language code
+            preserve_formatting (bool): Whether to preserve basic formatting
             
         Returns:
-            TranslationResult object
+            TranslationResult: Translation result
+            
+        Raises:
+            TranslationError: If translation fails
         """
-        if not extraction_result.success:
+        if not text or not text.strip():
             return TranslationResult(
-                pages=[],
-                success=False,
-                source_language=source_language,
-                target_language=target_language,
-                total_pages=extraction_result.total_pages,
-                error=f"Extraction failed: {extraction_result.error}"
+                original_text=text,
+                translated_text=text,
+                source_language=source_lang,
+                target_language=target_lang,
+                processing_time=0.0
             )
         
+        # Clean and prepare text
+        clean_text = self._prepare_text_for_translation(text, preserve_formatting)
+        
+        if len(clean_text) > self.max_chars:
+            raise TranslationError(
+                f"Text too long ({len(clean_text)} chars). Max allowed: {self.max_chars}"
+            )
+        
+        start_time = time.time()
+        
         try:
-            translated_pages = []
-            total_pages = len(extraction_result.pages)
+            # Make API request with retries
+            translated_text = self._make_translation_request(
+                clean_text, source_lang, target_lang
+            )
             
-            for i, page in enumerate(extraction_result.pages):
-                if progress_callback:
-                    progress_callback(
-                        i + 1,
-                        total_pages,
-                        f"Translating page {i + 1}/{total_pages}..."
-                    )
-                
-                # Convert page to HTML
-                html_content = self._page_to_html(page)
-                
-                # Translate HTML content
-                html_translated = self.translate_html(
-                    html_content,
-                    source_language,
-                    target_language
-                )
-                
-                # Extract plain text from translated HTML
-                translated_text = self._extract_text_from_html(html_translated)
-                
-                translated_pages.append(TranslatedPage(
-                    page_number=page.page_number,
-                    original_text=page.text,
-                    translated_text=translated_text,
-                    html_translated=html_translated,
-                    source_language=source_language,
-                    target_language=target_language
-                ))
+            processing_time = time.time() - start_time
+            
+            # Post-process translated text
+            if preserve_formatting:
+                translated_text = self._restore_formatting(text, translated_text)
             
             return TranslationResult(
-                pages=translated_pages,
-                success=True,
-                source_language=source_language,
-                target_language=target_language,
-                total_pages=total_pages
+                original_text=text,
+                translated_text=translated_text,
+                source_language=source_lang,
+                target_language=target_lang,
+                processing_time=processing_time
             )
             
         except Exception as e:
-            logger.exception(f"Translation failed: {str(e)}")
-            return TranslationResult(
-                pages=[],
-                success=False,
-                source_language=source_language,
-                target_language=target_language,
-                total_pages=extraction_result.total_pages,
-                error=f"Translation failed: {str(e)}"
-            )
+            logger.error(f"Translation failed for text length {len(text)}: {str(e)}")
+            raise TranslationError(f"Translation failed: {str(e)}")
     
-    def _page_to_html(self, page: PageText) -> str:
+    def translate_chunks(
+        self, 
+        text_chunks: List[str], 
+        source_lang: str = "gu", 
+        target_lang: str = "en",
+        progress_callback: Optional[Callable[[int, int, int], None]] = None
+    ) -> List[TranslationResult]:
         """
-        Convert a PageText object to HTML with structure preservation.
+        Translate multiple text chunks with progress tracking.
         
         Args:
-            page: PageText object from extraction
+            text_chunks (list): List of text chunks to translate
+            source_lang (str): Source language code
+            target_lang (str): Target language code
+            progress_callback (callable): Progress callback function
             
         Returns:
-            HTML string with preserved structure
-        """
-        html_parts = ['<div class="page">']
-        
-        # Add page number
-        html_parts.append(f'<div class="page-number">{page.page_number}</div>')
-        
-        # Process paragraphs
-        for paragraph in page.paragraphs:
-            # Escape HTML in the paragraph text
-            escaped_text = html.escape(paragraph)
+            list: List of TranslationResult objects
             
-            # Detect if this might be a heading (heuristic: shorter than 100 chars)
-            if len(paragraph) < 100 and paragraph.strip().endswith((':','.')) and not '\n' in paragraph:
-                html_parts.append(f'<h3>{escaped_text}</h3>')
-            else:
-                html_parts.append(f'<p>{escaped_text}</p>')
-        
-        html_parts.append('</div>')
-        return ''.join(html_parts)
-    
-    def _extract_text_from_html(self, html_content: str) -> str:
+        Raises:
+            TranslationError: If translation fails
         """
-        Extract plain text from HTML.
+        if not text_chunks:
+            return []
+        
+        results = []
+        total_chunks = len(text_chunks)
+        
+        logger.info(f"Starting translation of {total_chunks} chunks")
+        
+        for i, chunk in enumerate(text_chunks):
+            try:
+                # Translate individual chunk
+                result = self.translate_text(chunk, source_lang, target_lang)
+                result.chunk_id = i
+                results.append(result)
+                
+                # Call progress callback if provided
+                if progress_callback:
+                    progress = int((i + 1) / total_chunks * 100)
+                    progress_callback(progress, i + 1, total_chunks)
+                
+                # Rate limiting - small delay between requests
+                if i < total_chunks - 1:  # Don't delay after last chunk
+                    time.sleep(0.1)
+                
+                logger.debug(f"Translated chunk {i + 1}/{total_chunks}")
+                
+            except TranslationError:
+                # Re-raise translation errors
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error translating chunk {i}: {str(e)}")
+                raise TranslationError(f"Failed to translate chunk {i}: {str(e)}")
+        
+        logger.info(f"Successfully translated {len(results)} chunks")
+        return results
+    
+    def _make_translation_request(
+        self, 
+        text: str, 
+        source_lang: str, 
+        target_lang: str
+    ) -> str:
+        """
+        Make a single translation API request with retries.
         
         Args:
-            html_content: HTML content
+            text (str): Text to translate
+            source_lang (str): Source language code
+            target_lang (str): Target language code
             
         Returns:
-            Plain text
+            str: Translated text
+            
+        Raises:
+            TranslationError: If all retry attempts fail
         """
-        soup = BeautifulSoup(html_content, 'html.parser')
-        return soup.get_text(separator='\n\n')
+        payload = {
+            "input": text,
+            "source_language_code": source_lang,
+            "target_language_code": target_lang,
+            "speaker_gender": "Male",  # Default for legal documents
+            "mode": "formal",  # Formal tone for legal text
+            "model": "mayura:v1",  # Sarvam's translation model
+            "enable_preprocessing": True
+        }
+        
+        last_error = None
+        
+        for attempt in range(self.max_retries):
+            try:
+                logger.debug(f"Translation attempt {attempt + 1}/{self.max_retries}")
+                
+                response = self.session.post(
+                    self.translate_endpoint,
+                    json=payload,
+                    timeout=30
+                )
+                
+                # Handle HTTP errors
+                if response.status_code == 401:
+                    raise TranslationError("Invalid API key")
+                elif response.status_code == 429:
+                    raise TranslationError("Rate limit exceeded")
+                elif response.status_code == 400:
+                    error_msg = "Bad request - check input parameters"
+                    try:
+                        error_detail = response.json().get('message', '')
+                        if error_detail:
+                            error_msg += f": {error_detail}"
+                    except:
+                        pass
+                    raise TranslationError(error_msg)
+                elif response.status_code >= 500:
+                    raise TranslationError(f"Server error: {response.status_code}")
+                elif response.status_code != 200:
+                    raise TranslationError(f"API error: {response.status_code}")
+                
+                # Parse response
+                try:
+                    response_data = response.json()
+                except ValueError:
+                    raise TranslationError("Invalid JSON response from API")
+                
+                # Extract translated text
+                translated_text = response_data.get('translated_text')
+                if not translated_text:
+                    # Try alternative response formats
+                    translated_text = response_data.get('translation', '')
+                    if not translated_text:
+                        raise TranslationError("No translated text in API response")
+                
+                return translated_text
+                
+            except TranslationError:
+                # Don't retry on client errors
+                raise
+            except requests.exceptions.Timeout:
+                last_error = TranslationError("Request timeout")
+            except requests.exceptions.ConnectionError:
+                last_error = TranslationError("Connection error")
+            except requests.exceptions.RequestException as e:
+                last_error = TranslationError(f"Request failed: {str(e)}")
+            except Exception as e:
+                last_error = TranslationError(f"Unexpected error: {str(e)}")
+            
+            # Wait before retry with exponential backoff
+            if attempt < self.max_retries - 1:
+                wait_time = self.retry_delay * (2 ** attempt)
+                logger.warning(f"Retrying in {wait_time:.1f}s (attempt {attempt + 1})")
+                time.sleep(wait_time)
+        
+        # All retries failed
+        raise last_error or TranslationError("Translation failed after retries")
+    
+    def _prepare_text_for_translation(self, text: str, preserve_formatting: bool) -> str:
+        """
+        Prepare text for translation by cleaning and normalizing.
+        
+        Args:
+            text (str): Original text
+            preserve_formatting (bool): Whether to preserve formatting
+            
+        Returns:
+            str: Cleaned text
+        """
+        if not text:
+            return ""
+        
+        # Basic cleanup
+        cleaned = text.strip()
+        
+        # Normalize whitespace but preserve intentional line breaks
+        if preserve_formatting:
+            # Replace multiple spaces with single space, but keep line breaks
+            cleaned = ' '.join(cleaned.split(' '))
+            # Normalize line breaks
+            cleaned = cleaned.replace('\r\n', '\n').replace('\r', '\n')
+        else:
+            # More aggressive cleanup
+            cleaned = ' '.join(cleaned.split())
+        
+        return cleaned
+    
+    def _restore_formatting(self, original: str, translated: str) -> str:
+        """
+        Attempt to restore basic formatting from original to translated text.
+        
+        Args:
+            original (str): Original text with formatting
+            translated (str): Translated text
+            
+        Returns:
+            str: Translated text with restored formatting
+        """
+        if not original or not translated:
+            return translated
+        
+        # Simple heuristic: if original had multiple paragraphs,
+        # try to maintain similar structure in translation
+        original_lines = original.count('\n')
+        translated_lines = translated.count('\n')
+        
+        # If original had significant line breaks and translated doesn't,
+        # try to add some structure back
+        if original_lines > 2 and translated_lines == 0:
+            # Split translated text by sentences and add line breaks
+            sentences = translated.split('. ')
+            if len(sentences) > 2:
+                # Add line breaks after every 2-3 sentences
+                formatted_sentences = []
+                for i, sentence in enumerate(sentences):
+                    if sentence.strip():
+                        if i < len(sentences) - 1:
+                            formatted_sentences.append(sentence + '.')
+                        else:
+                            formatted_sentences.append(sentence)
+                        
+                        # Add paragraph break every 2-3 sentences
+                        if (i + 1) % 3 == 0 and i < len(sentences) - 1:
+                            formatted_sentences.append('\n\n')
+                        elif i < len(sentences) - 1:
+                            formatted_sentences.append(' ')
+                
+                translated = ''.join(formatted_sentences)
+        
+        return translated
+    
+    def get_supported_languages(self) -> Dict[str, str]:
+        """
+        Get supported language codes and names.
+        
+        Returns:
+            dict: Mapping of language codes to names
+        """
+        return {
+            'gu': 'Gujarati',
+            'en': 'English',
+            'hi': 'Hindi',
+            'bn': 'Bengali',
+            'ta': 'Tamil',
+            'te': 'Telugu',
+            'ml': 'Malayalam',
+            'kn': 'Kannada',
+            'mr': 'Marathi',
+            'pa': 'Punjabi',
+            'or': 'Odia'
+        }
+    
+    def validate_language_pair(self, source_lang: str, target_lang: str) -> bool:
+        """
+        Validate if the language pair is supported.
+        
+        Args:
+            source_lang (str): Source language code
+            target_lang (str): Target language code
+            
+        Returns:
+            bool: True if supported
+        """
+        supported = self.get_supported_languages()
+        return source_lang in supported and target_lang in supported
+    
+    def estimate_cost(self, text_chunks: List[str]) -> Dict[str, Any]:
+        """
+        Estimate translation cost based on text length.
+        
+        Args:
+            text_chunks (list): List of text chunks
+            
+        Returns:
+            dict: Cost estimation details
+        """
+        total_chars = sum(len(chunk) for chunk in text_chunks)
+        total_requests = len(text_chunks)
+        
+        # Rough cost estimation (adjust based on actual Sarvam pricing)
+        estimated_cost_per_1k_chars = 0.02  # Example rate
+        estimated_cost = (total_chars / 1000) * estimated_cost_per_1k_chars
+        
+        return {
+            'total_characters': total_chars,
+            'total_requests': total_requests,
+            'estimated_cost_usd': round(estimated_cost, 4),
+            'average_chunk_size': round(total_chars / total_requests) if total_requests > 0 else 0
+        }
 
-def translate_document(
-    extraction_result: ExtractionResult,
-    source_language: str,
-    target_language: str,
+def create_translator(
     api_key: str,
     api_url: str = "https://api.sarvam.ai/v1",
-    progress_callback: Optional[Callable[[int, int, str], None]] = None
-) -> TranslationResult:
+    max_chars: int = 1000
+) -> SarvamTranslator:
     """
-    Translate an extracted document using Sarvam AI.
+    Factory function to create a translator instance.
     
     Args:
-        extraction_result: ExtractionResult from the extractor service
-        source_language: Source language code
-        target_language: Target language code
-        api_key: Sarvam AI API key
-        api_url: Base URL for the Sarvam API
-        progress_callback: Optional callback for progress updates
+        api_key (str): Sarvam AI API key
+        api_url (str): API base URL
+        max_chars (int): Maximum characters per request
         
     Returns:
-        TranslationResult object
+        SarvamTranslator: Configured translator instance
     """
-    translator = SarvamTranslator(api_key=api_key, api_url=api_url)
-    
-    return translator.translate_extraction_result(
-        extraction_result,
-        source_language,
-        target_language,
-        progress_callback
+    return SarvamTranslator(
+        api_key=api_key,
+        api_url=api_url,
+        max_chars_per_request=max_chars
     )
