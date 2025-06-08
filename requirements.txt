@@ -1,0 +1,35 @@
+# Flask and related
+Flask==2.3.3
+Flask-CORS==4.0.0
+python-dotenv==1.0.0
+
+# Supabase
+supabase==2.0.3
+storage3==0.6.1  # Required for Supabase storage
+
+# PDF Processing
+pdfplumber==0.10.3
+PyPDF2==3.0.1
+pdf2image==1.17.0
+pytesseract==0.3.10
+
+# PDF Generation
+WeasyPrint==60.1
+html5lib==1.1  # Required by WeasyPrint
+
+# HTTP requests
+requests==2.31.0
+urllib3<2.0.0  # Compatibility with requests
+
+# Development tools
+pytest==7.4.3
+black==23.11.0
+pre-commit==3.5.0
+flake8==6.1.0
+
+# Production
+gunicorn==21.2.0
+
+# Utilities
+Pillow>=10.1.0  # Required by pdf2image
+numpy>=1.26.0  # Required by various PDF processing libraries
