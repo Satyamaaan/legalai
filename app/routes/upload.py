@@ -1,277 +1,237 @@
 """
-Upload blueprint for handling PDF file uploads.
+Upload route handlers for the Legal Document Translator.
 
-This module defines routes for:
-1. Generating presigned upload URLs for Supabase Storage
-2. Validating file metadata
-3. Creating file and translation job records
+This module handles file upload endpoints, generates signed URLs for
+direct upload to Supabase Storage, and creates database records.
 """
 
 import os
-import re
 import uuid
 import logging
-from datetime import datetime
+from typing import Dict, Any, Optional
 from flask import Blueprint, request, jsonify, current_app
 from werkzeug.utils import secure_filename
+
+from app.services.supabase_client import SupabaseClient, SupabaseClientError
+
+logger = logging.getLogger(__name__)
 
 # Create blueprint
 upload_bp = Blueprint('upload', __name__, url_prefix='/api/upload')
 
-# Configure logger
-logger = logging.getLogger(__name__)
-
-# Allowed file extensions and MIME types
+# Allowed file extensions
 ALLOWED_EXTENSIONS = {'pdf'}
-ALLOWED_MIME_TYPES = {'application/pdf'}
 
-def allowed_file(filename):
-    """
-    Check if the file has an allowed extension.
-    
-    Args:
-        filename (str): The filename to check
-        
-    Returns:
-        bool: True if file extension is allowed, False otherwise
-    """
+def allowed_file(filename: str) -> bool:
+    """Check if the file extension is allowed."""
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def allowed_mime_type(mime_type):
-    """
-    Check if the MIME type is allowed.
+def get_supabase_client() -> SupabaseClient:
+    """Get Supabase client from Flask app context."""
+    if not hasattr(current_app, 'supabase') or current_app.supabase is None:
+        raise SupabaseClientError("Supabase client not initialized")
     
-    Args:
-        mime_type (str): The MIME type to check
-        
-    Returns:
-        bool: True if MIME type is allowed, False otherwise
-    """
-    return mime_type in ALLOWED_MIME_TYPES
+    return SupabaseClient(
+        current_app.config['SUPABASE_URL'],
+        current_app.config['SUPABASE_SERVICE_KEY']
+    )
 
-def generate_secure_storage_path(original_filename):
+@upload_bp.route('/signed-url', methods=['POST'])
+def get_upload_signed_url():
     """
-    Generate a secure and unique storage path for a file.
+    Generate a signed URL for file upload.
     
-    Args:
-        original_filename (str): Original filename
-        
-    Returns:
-        str: Secure storage path
-    """
-    # Secure the filename
-    secure_name = secure_filename(original_filename)
-    
-    # Generate a unique identifier
-    unique_id = str(uuid.uuid4())
-    
-    # Generate timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Extract extension
-    _, ext = os.path.splitext(secure_name)
-    if not ext:
-        ext = '.pdf'  # Default to .pdf if no extension
-    
-    # Create path: timestamp_uniqueid_securename.ext
-    return f"{timestamp}_{unique_id}{ext}"
-
-@upload_bp.route('/presigned-url', methods=['POST'])
-def get_presigned_upload_url():
-    """
-    Generate a presigned URL for uploading a PDF file to Supabase Storage.
-    
-    Request JSON:
+    Expected JSON payload:
     {
         "filename": "document.pdf",
-        "mime_type": "application/pdf",
-        "size_bytes": 1024000,
-        "src_lang": "gu",  # Optional, defaults to "gu"
-        "tgt_lang": "en"   # Optional, defaults to "en"
+        "content_type": "application/pdf"
     }
     
     Returns:
-        JSON with presigned URL, job ID, and upload details
+    {
+        "upload_url": "https://...",
+        "file_id": "uuid",
+        "job_id": "uuid"
+    }
     """
     try:
-        # Check if Supabase client is initialized
-        if not hasattr(current_app, 'supabase') or current_app.supabase is None:
-            logger.error("Supabase client not initialized")
-            return jsonify({
-                "error": "Storage service unavailable",
-                "message": "Could not connect to storage service"
-            }), 503
+        # Validate request
+        if not request.is_json:
+            return jsonify({"error": "Content-Type must be application/json"}), 400
         
-        # Get request data
         data = request.get_json()
-        
         if not data:
-            return jsonify({
-                "error": "Bad Request",
-                "message": "Missing request data"
-            }), 400
+            return jsonify({"error": "No JSON data provided"}), 400
         
-        # Validate required fields
-        required_fields = ['filename', 'mime_type', 'size_bytes']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    "error": "Bad Request",
-                    "message": f"Missing required field: {field}"
-                }), 400
+        filename = data.get('filename')
+        content_type = data.get('content_type', 'application/pdf')
         
-        filename = data['filename']
-        mime_type = data['mime_type']
-        size_bytes = data['size_bytes']
-        src_lang = data.get('src_lang', 'gu')  # Default to Gujarati
-        tgt_lang = data.get('tgt_lang', 'en')  # Default to English
+        if not filename:
+            return jsonify({"error": "filename is required"}), 400
         
         # Validate file extension
         if not allowed_file(filename):
             return jsonify({
-                "error": "Invalid File",
-                "message": "Only PDF files are allowed"
+                "error": f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"
             }), 400
         
-        # Validate MIME type
-        if not allowed_mime_type(mime_type):
-            return jsonify({
-                "error": "Invalid File",
-                "message": "Invalid MIME type. Only application/pdf is allowed"
-            }), 400
+        # Secure the filename
+        secure_name = secure_filename(filename)
+        if not secure_name:
+            return jsonify({"error": "Invalid filename"}), 400
         
-        # Validate file size
-        max_size = current_app.config['MAX_CONTENT_LENGTH']
-        if size_bytes > max_size:
-            return jsonify({
-                "error": "File Too Large",
-                "message": f"File exceeds maximum allowed size of {max_size / (1024 * 1024)}MB"
-            }), 413
+        # Get Supabase client
+        supabase = get_supabase_client()
         
-        # Generate secure storage path
-        bucket = current_app.config['UPLOADS_BUCKET']
-        storage_path = generate_secure_storage_path(filename)
+        # Generate unique storage path
+        storage_path = supabase.generate_storage_path("uploads", secure_name)
         
-        # Get user ID if authentication is enabled
-        user_id = None
-        # If auth is implemented, get user_id from session/token
-        
-        # Create file record in database
-        from app.services.supabase_client import SupabaseClient
-        supabase = SupabaseClient(
-            current_app.config['SUPABASE_URL'],
-            current_app.config['SUPABASE_SERVICE_KEY']
-        )
-        
-        # Create file and job records in a single operation
-        job = supabase.create_translation_job_with_file(
-            original_name=filename,
-            bucket=bucket,
-            storage_path=storage_path,
-            src_lang=src_lang,
-            tgt_lang=tgt_lang,
-            user_id=user_id
-        )
-        
-        # Generate presigned upload URL
-        upload_url_data = supabase.get_upload_signed_url(
-            bucket=bucket,
+        # Generate signed upload URL
+        upload_result = supabase.get_upload_signed_url(
+            bucket=current_app.config['UPLOADS_BUCKET'],
             path=storage_path,
-            expires_in=60  # URL expires in 60 seconds
+            expires_in=300  # 5 minutes
         )
         
-        # Return response with presigned URL and job ID
+        # Create file and job records
+        job_data = supabase.create_translation_job_with_file(
+            original_name=filename,
+            bucket=current_app.config['UPLOADS_BUCKET'],
+            storage_path=storage_path,
+            src_lang=data.get('src_lang', 'gu'),
+            tgt_lang=data.get('tgt_lang', 'en')
+        )
+        
         return jsonify({
-            "job_id": job["id"],
-            "upload_url": upload_url_data["signed_url"],
-            "file_id": job["file"]["id"],
-            "storage_path": storage_path,
-            "expires_in": 60,  # seconds
-            "bucket": bucket
+            "upload_url": upload_result["signed_url"],
+            "file_id": job_data["file"]["id"],
+            "job_id": job_data["id"],
+            "storage_path": storage_path
         }), 200
         
-    except Exception as e:
-        logger.exception(f"Error generating presigned URL: {str(e)}")
-        return jsonify({
-            "error": "Server Error",
-            "message": "Failed to generate upload URL"
-        }), 500
-
-@upload_bp.route('/validate', methods=['POST'])
-def validate_file():
-    """
-    Validate file metadata without generating a presigned URL.
-    Useful for client-side validation before attempting upload.
+    except SupabaseClientError as e:
+        logger.error(f"Supabase error in upload endpoint: {str(e)}")
+        return jsonify({"error": "Database operation failed"}), 500
     
-    Request JSON:
+    except Exception as e:
+        logger.error(f"Unexpected error in upload endpoint: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@upload_bp.route('/confirm', methods=['POST'])
+def confirm_upload():
+    """
+    Confirm that file upload was successful and start processing.
+    
+    Expected JSON payload:
     {
-        "filename": "document.pdf",
-        "mime_type": "application/pdf",
-        "size_bytes": 1024000
+        "job_id": "uuid"
     }
     
     Returns:
-        JSON with validation result
+    {
+        "job_id": "uuid",
+        "status": "processing"
+    }
     """
     try:
-        # Get request data
+        # Validate request
+        if not request.is_json:
+            return jsonify({"error": "Content-Type must be application/json"}), 400
+        
         data = request.get_json()
-        
         if not data:
-            return jsonify({
-                "error": "Bad Request",
-                "message": "Missing request data"
-            }), 400
+            return jsonify({"error": "No JSON data provided"}), 400
         
-        # Validate required fields
-        required_fields = ['filename', 'mime_type', 'size_bytes']
-        missing_fields = [field for field in required_fields if field not in data]
+        job_id = data.get('job_id')
+        if not job_id:
+            return jsonify({"error": "job_id is required"}), 400
         
-        if missing_fields:
-            return jsonify({
-                "error": "Bad Request",
-                "message": f"Missing required fields: {', '.join(missing_fields)}"
-            }), 400
+        # Get Supabase client
+        supabase = get_supabase_client()
         
-        filename = data['filename']
-        mime_type = data['mime_type']
-        size_bytes = data['size_bytes']
+        # Update job status to processing
+        updated_job = supabase.update_job_progress(
+            job_id=job_id,
+            progress=5,
+            status="processing"
+        )
         
-        # Validate file extension
-        if not allowed_file(filename):
-            return jsonify({
-                "valid": False,
-                "error": "Invalid file extension",
-                "message": "Only PDF files are allowed"
-            }), 200
+        # TODO: Trigger background processing job here
+        # This will be implemented when we create the job orchestrator
         
-        # Validate MIME type
-        if not allowed_mime_type(mime_type):
-            return jsonify({
-                "valid": False,
-                "error": "Invalid MIME type",
-                "message": "Only application/pdf is allowed"
-            }), 200
-        
-        # Validate file size
-        max_size = current_app.config['MAX_CONTENT_LENGTH']
-        if size_bytes > max_size:
-            return jsonify({
-                "valid": False,
-                "error": "File too large",
-                "message": f"File exceeds maximum allowed size of {max_size / (1024 * 1024)}MB"
-            }), 200
-        
-        # All validations passed
         return jsonify({
-            "valid": True,
-            "message": "File is valid"
+            "job_id": job_id,
+            "status": updated_job["status"],
+            "progress": updated_job["progress"]
         }), 200
         
+    except SupabaseClientError as e:
+        logger.error(f"Supabase error in confirm upload: {str(e)}")
+        return jsonify({"error": "Database operation failed"}), 500
+    
     except Exception as e:
-        logger.exception(f"Error validating file: {str(e)}")
+        logger.error(f"Unexpected error in confirm upload: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@upload_bp.route('/status/<job_id>', methods=['GET'])
+def get_job_status(job_id: str):
+    """
+    Get the status of a translation job.
+    
+    Returns:
+    {
+        "job_id": "uuid",
+        "status": "processing",
+        "progress": 45,
+        "file": {...}
+    }
+    """
+    try:
+        # Get Supabase client
+        supabase = get_supabase_client()
+        
+        # Get job with file data
+        job_data = supabase.get_job_with_file(job_id)
+        
         return jsonify({
-            "error": "Server Error",
-            "message": "Failed to validate file"
+            "job_id": job_data["id"],
+            "status": job_data["status"],
+            "progress": job_data["progress"],
+            "src_lang": job_data["src_lang"],
+            "tgt_lang": job_data["tgt_lang"],
+            "error_message": job_data.get("error_message"),
+            "created_at": job_data["created_at"],
+            "updated_at": job_data["updated_at"],
+            "file": {
+                "id": job_data["files"]["id"],
+                "original_name": job_data["files"]["original_name"],
+                "created_at": job_data["files"]["created_at"]
+            }
+        }), 200
+        
+    except SupabaseClientError as e:
+        logger.error(f"Supabase error getting job status: {str(e)}")
+        return jsonify({"error": "Job not found or database error"}), 404
+    
+    except Exception as e:
+        logger.error(f"Unexpected error getting job status: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+# Health check for the upload blueprint
+@upload_bp.route('/health', methods=['GET'])
+def upload_health():
+    """Health check endpoint for upload service."""
+    try:
+        supabase = get_supabase_client()
+        return jsonify({
+            "status": "healthy",
+            "service": "upload",
+            "supabase": "connected"
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "service": "upload",
+            "error": str(e)
         }), 500

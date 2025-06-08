@@ -1,543 +1,409 @@
 """
-PDF text extraction service.
+PDF text extraction service for the Legal Document Translator.
 
-This module provides functionality to extract text from PDF documents,
-with support for both searchable PDFs and scanned documents requiring OCR.
-It implements a fallback strategy to maximize extraction success.
+This service handles PDF text extraction using multiple strategies:
+1. pdfplumber for selectable text PDFs
+2. OCR with Tesseract for scanned/image PDFs
+3. Fallback to PyPDF2 for basic extraction
+
+Returns structured HTML/text with preserved formatting.
 """
 
 import os
-import re
+import io
 import logging
 import tempfile
-from typing import Dict, List, Optional, Union, Tuple, Callable
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 
 import pdfplumber
 import PyPDF2
 import pytesseract
-from pdf2image import convert_from_path, convert_from_bytes
+from pdf2image import convert_from_path
 from PIL import Image
-import numpy as np
 
-# Configure logger
 logger = logging.getLogger(__name__)
 
-@dataclass
-class PageText:
-    """
-    Represents extracted text from a single PDF page with metadata.
-    """
-    page_number: int
-    text: str
-    paragraphs: List[str]
-    is_ocr: bool = False
-    confidence: Optional[float] = None
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary representation."""
-        return {
-            "page_number": self.page_number,
-            "text": self.text,
-            "paragraphs": self.paragraphs,
-            "is_ocr": self.is_ocr,
-            "confidence": self.confidence
-        }
-
-@dataclass
-class ExtractionResult:
-    """
-    Represents the complete result of a PDF text extraction.
-    """
-    pages: List[PageText]
-    success: bool
-    method_used: str
-    total_pages: int
-    error: Optional[str] = None
-    
-    @property
-    def full_text(self) -> str:
-        """Get the full text of all pages concatenated."""
-        return "\n\n".join(page.text for page in self.pages)
-    
-    @property
-    def is_empty(self) -> bool:
-        """Check if the extraction result is empty."""
-        return len(self.pages) == 0 or all(not page.text.strip() for page in self.pages)
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary representation."""
-        return {
-            "pages": [page.to_dict() for page in self.pages],
-            "success": self.success,
-            "method_used": self.method_used,
-            "total_pages": self.total_pages,
-            "error": self.error,
-            "is_empty": self.is_empty
-        }
-
 class ExtractionError(Exception):
-    """Base exception for extraction errors."""
+    """Custom exception for PDF extraction errors."""
     pass
 
-def extract_text_from_pdf(
-    pdf_path: str,
-    ocr_lang: str = "guj",
-    progress_callback: Optional[Callable[[int, int, str], None]] = None,
-    tesseract_path: Optional[str] = None
-) -> ExtractionResult:
+class PDFExtractor:
     """
-    Extract text from a PDF file using multiple methods with fallback.
-    
-    Args:
-        pdf_path: Path to the PDF file
-        ocr_lang: Tesseract language code (default: "guj" for Gujarati)
-        progress_callback: Optional callback function to report progress
-            Args: current_page, total_pages, status_message
-        tesseract_path: Optional path to tesseract executable
-    
-    Returns:
-        ExtractionResult object containing the extracted text and metadata
-    
-    Raises:
-        ExtractionError: If all extraction methods fail
-        FileNotFoundError: If the PDF file does not exist
+    PDF text extraction service with multiple extraction strategies.
     """
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
     
-    # Configure tesseract path if provided
-    if tesseract_path:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    def __init__(self, tesseract_path: Optional[str] = None):
+        """
+        Initialize the PDF extractor.
+        
+        Args:
+            tesseract_path (str, optional): Path to Tesseract executable
+        """
+        self.tesseract_path = tesseract_path
+        if tesseract_path and os.path.exists(tesseract_path):
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        
+        # Configure Tesseract for Gujarati
+        self.tesseract_config = '--oem 3 --psm 6 -l guj+eng'
+        
+        # Minimum text threshold to determine if PDF has selectable text
+        self.min_text_threshold = 100
     
-    # Get total page count for progress reporting
-    try:
-        with open(pdf_path, 'rb') as f:
-            pdf_reader = PyPDF2.PdfReader(f)
-            total_pages = len(pdf_reader.pages)
-    except Exception as e:
-        logger.error(f"Error getting page count: {str(e)}")
-        total_pages = 0  # Will be updated later if possible
-    
-    # Try extraction methods in order
-    extraction_methods = [
-        (_extract_with_pdfplumber, "pdfplumber"),
-        (_extract_with_pypdf2, "PyPDF2"),
-        (_extract_with_ocr, "tesseract-ocr")
-    ]
-    
-    last_error = None
-    for extract_func, method_name in extraction_methods:
+    def extract_from_file(self, file_path: str) -> Dict[str, Any]:
+        """
+        Extract text from a PDF file using the best available method.
+        
+        Args:
+            file_path (str): Path to the PDF file
+            
+        Returns:
+            dict: Extraction result with text, metadata, and structure
+            
+        Raises:
+            ExtractionError: If extraction fails
+        """
+        if not os.path.exists(file_path):
+            raise ExtractionError(f"File not found: {file_path}")
+        
+        if not file_path.lower().endswith('.pdf'):
+            raise ExtractionError(f"File must be a PDF: {file_path}")
+        
         try:
-            logger.info(f"Attempting extraction with {method_name}")
+            logger.info(f"Starting extraction for: {file_path}")
             
-            if progress_callback:
-                progress_callback(0, total_pages, f"Extracting text using {method_name}...")
+            # Try pdfplumber first (best for selectable text)
+            result = self._extract_with_pdfplumber(file_path)
             
-            result = extract_func(
-                pdf_path, 
-                total_pages=total_pages,
-                progress_callback=progress_callback,
-                ocr_lang=ocr_lang
-            )
-            
-            # If extraction was successful and produced text
-            if result.success and not result.is_empty:
-                logger.info(f"Extraction successful with {method_name}")
-                return result
-            
-            # If extraction was successful but produced no text, try next method
-            if result.success and result.is_empty:
-                logger.warning(f"Extraction with {method_name} produced no text, trying next method")
-                last_error = ExtractionError(f"No text extracted with {method_name}")
-            
-        except Exception as e:
-            logger.warning(f"Extraction with {method_name} failed: {str(e)}")
-            last_error = e
-    
-    # If we get here, all methods failed
-    error_msg = str(last_error) if last_error else "All extraction methods failed"
-    logger.error(f"PDF text extraction failed: {error_msg}")
-    
-    return ExtractionResult(
-        pages=[],
-        success=False,
-        method_used="none",
-        total_pages=total_pages,
-        error=error_msg
-    )
-
-def _extract_with_pdfplumber(
-    pdf_path: str,
-    total_pages: int,
-    progress_callback: Optional[Callable] = None,
-    **kwargs
-) -> ExtractionResult:
-    """
-    Extract text from a PDF using pdfplumber.
-    
-    Args:
-        pdf_path: Path to the PDF file
-        total_pages: Total number of pages in the PDF
-        progress_callback: Optional callback function to report progress
-        **kwargs: Additional arguments (not used by this method)
-    
-    Returns:
-        ExtractionResult object
-    """
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            # Update total_pages if it was not determined correctly
-            if total_pages == 0:
-                total_pages = len(pdf.pages)
-            
-            pages = []
-            for i, page in enumerate(pdf.pages):
-                if progress_callback:
-                    progress_callback(i + 1, total_pages, f"Extracting page {i + 1}/{total_pages} with pdfplumber...")
+            # If we didn't get enough text, try OCR
+            if len(result['raw_text']) < self.min_text_threshold:
+                logger.info("Insufficient text found, attempting OCR extraction")
+                ocr_result = self._extract_with_ocr(file_path)
                 
-                # Extract text
-                text = page.extract_text() or ""
-                
-                # Split into paragraphs (by double newlines or significant spacing)
-                paragraphs = [p for p in re.split(r'\n\s*\n', text) if p.strip()]
-                
-                # If no paragraphs were found but there's text, treat the whole text as one paragraph
-                if not paragraphs and text.strip():
-                    paragraphs = [text.strip()]
-                
-                pages.append(PageText(
-                    page_number=i + 1,
-                    text=text,
-                    paragraphs=paragraphs,
-                    is_ocr=False,
-                    confidence=1.0  # High confidence for direct extraction
-                ))
-            
-            return ExtractionResult(
-                pages=pages,
-                success=True,
-                method_used="pdfplumber",
-                total_pages=total_pages
-            )
-    
-    except Exception as e:
-        logger.error(f"pdfplumber extraction failed: {str(e)}")
-        raise ExtractionError(f"pdfplumber extraction failed: {str(e)}")
-
-def _extract_with_pypdf2(
-    pdf_path: str,
-    total_pages: int,
-    progress_callback: Optional[Callable] = None,
-    **kwargs
-) -> ExtractionResult:
-    """
-    Extract text from a PDF using PyPDF2.
-    
-    Args:
-        pdf_path: Path to the PDF file
-        total_pages: Total number of pages in the PDF
-        progress_callback: Optional callback function to report progress
-        **kwargs: Additional arguments (not used by this method)
-    
-    Returns:
-        ExtractionResult object
-    """
-    try:
-        with open(pdf_path, 'rb') as f:
-            pdf_reader = PyPDF2.PdfReader(f)
-            
-            # Update total_pages if it was not determined correctly
-            if total_pages == 0:
-                total_pages = len(pdf_reader.pages)
-            
-            pages = []
-            for i in range(total_pages):
-                if progress_callback:
-                    progress_callback(i + 1, total_pages, f"Extracting page {i + 1}/{total_pages} with PyPDF2...")
-                
-                # Extract text
-                page = pdf_reader.pages[i]
-                text = page.extract_text() or ""
-                
-                # Split into paragraphs (by double newlines or significant spacing)
-                paragraphs = [p for p in re.split(r'\n\s*\n', text) if p.strip()]
-                
-                # If no paragraphs were found but there's text, treat the whole text as one paragraph
-                if not paragraphs and text.strip():
-                    paragraphs = [text.strip()]
-                
-                pages.append(PageText(
-                    page_number=i + 1,
-                    text=text,
-                    paragraphs=paragraphs,
-                    is_ocr=False,
-                    confidence=0.9  # Slightly lower confidence than pdfplumber
-                ))
-            
-            return ExtractionResult(
-                pages=pages,
-                success=True,
-                method_used="PyPDF2",
-                total_pages=total_pages
-            )
-    
-    except Exception as e:
-        logger.error(f"PyPDF2 extraction failed: {str(e)}")
-        raise ExtractionError(f"PyPDF2 extraction failed: {str(e)}")
-
-def _extract_with_ocr(
-    pdf_path: str,
-    total_pages: int,
-    progress_callback: Optional[Callable] = None,
-    ocr_lang: str = "guj",
-    dpi: int = 300,
-    **kwargs
-) -> ExtractionResult:
-    """
-    Extract text from a PDF using OCR (Tesseract).
-    
-    Args:
-        pdf_path: Path to the PDF file
-        total_pages: Total number of pages in the PDF
-        progress_callback: Optional callback function to report progress
-        ocr_lang: Tesseract language code (default: "guj" for Gujarati)
-        dpi: DPI for PDF to image conversion (higher is better quality but slower)
-        **kwargs: Additional arguments
-    
-    Returns:
-        ExtractionResult object
-    """
-    try:
-        # Convert PDF to images
-        if progress_callback:
-            progress_callback(0, total_pages, "Converting PDF to images for OCR...")
-        
-        images = convert_from_path(pdf_path, dpi=dpi)
-        
-        # Update total_pages if it was not determined correctly
-        if total_pages == 0:
-            total_pages = len(images)
-        
-        pages = []
-        for i, image in enumerate(images):
-            if progress_callback:
-                progress_callback(i + 1, total_pages, f"OCR processing page {i + 1}/{total_pages}...")
-            
-            # Process image with Tesseract
-            ocr_config = f'--oem 3 --psm 6 -l {ocr_lang}'
-            
-            # Get OCR data including confidence
-            ocr_data = pytesseract.image_to_data(image, config=ocr_config, output_type=pytesseract.Output.DICT)
-            
-            # Extract text and calculate confidence
-            text_parts = []
-            confidence_values = []
-            
-            for j in range(len(ocr_data['text'])):
-                if ocr_data['text'][j].strip():
-                    text_parts.append(ocr_data['text'][j])
-                    confidence_values.append(float(ocr_data['conf'][j]))
-            
-            # Join text parts
-            text = ' '.join(text_parts)
-            
-            # Calculate average confidence (excluding -1 values)
-            valid_confidences = [c for c in confidence_values if c >= 0]
-            avg_confidence = sum(valid_confidences) / len(valid_confidences) / 100.0 if valid_confidences else 0
-            
-            # Split into paragraphs (using whitespace patterns)
-            # For OCR, we use a more aggressive paragraph detection
-            paragraphs = []
-            current_para = []
-            
-            for line in text.split('\n'):
-                if not line.strip():
-                    if current_para:
-                        paragraphs.append(' '.join(current_para))
-                        current_para = []
+                # Use OCR result if it has more text
+                if len(ocr_result['raw_text']) > len(result['raw_text']):
+                    result = ocr_result
+                    result['extraction_method'] = 'ocr'
                 else:
-                    current_para.append(line.strip())
+                    result['extraction_method'] = 'pdfplumber_sparse'
+            else:
+                result['extraction_method'] = 'pdfplumber'
             
-            # Add the last paragraph if it exists
-            if current_para:
-                paragraphs.append(' '.join(current_para))
+            # Generate structured HTML
+            result['structured_html'] = self._generate_structured_html(result)
             
-            # If no paragraphs were found but there's text, treat the whole text as one paragraph
-            if not paragraphs and text.strip():
-                paragraphs = [text.strip()]
+            logger.info(f"Extraction completed. Method: {result['extraction_method']}, "
+                       f"Text length: {len(result['raw_text'])}, "
+                       f"Pages: {result['metadata']['page_count']}")
             
-            pages.append(PageText(
-                page_number=i + 1,
-                text=text,
-                paragraphs=paragraphs,
-                is_ocr=True,
-                confidence=avg_confidence
-            ))
-        
-        return ExtractionResult(
-            pages=pages,
-            success=True,
-            method_used="tesseract-ocr",
-            total_pages=total_pages
-        )
-    
-    except Exception as e:
-        logger.error(f"OCR extraction failed: {str(e)}")
-        raise ExtractionError(f"OCR extraction failed: {str(e)}")
-
-def is_scanned_pdf(pdf_path: str, threshold: float = 0.1) -> bool:
-    """
-    Determine if a PDF is likely a scanned document.
-    
-    Args:
-        pdf_path: Path to the PDF file
-        threshold: Minimum text content ratio to consider a page as digital
-    
-    Returns:
-        bool: True if the PDF appears to be scanned, False otherwise
-    """
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            # Check a sample of pages (first, middle, last)
-            total_pages = len(pdf.pages)
+            return result
             
-            if total_pages == 0:
-                return False
-            
-            pages_to_check = [0]  # Always check first page
-            
-            if total_pages > 1:
-                pages_to_check.append(total_pages - 1)  # Last page
-            
-            if total_pages > 2:
-                pages_to_check.append(total_pages // 2)  # Middle page
-            
-            for page_idx in pages_to_check:
-                page = pdf.pages[page_idx]
-                
-                # Get page dimensions
-                width, height = page.width, page.height
-                page_area = width * height
-                
-                # Extract text and calculate its length
-                text = page.extract_text() or ""
-                text_length = len(text.strip())
-                
-                # Calculate text density (characters per unit area)
-                text_density = text_length / page_area if page_area > 0 else 0
-                
-                # If any page has sufficient text density, consider it not scanned
-                if text_density > threshold:
-                    return False
-            
-            # If we get here, all checked pages had low text density
-            return True
-    
-    except Exception as e:
-        logger.warning(f"Error checking if PDF is scanned: {str(e)}")
-        # If we can't determine, assume it might be scanned
-        return True
-
-def extract_text_with_best_method(
-    pdf_path: str,
-    ocr_lang: str = "guj",
-    force_ocr: bool = False,
-    progress_callback: Optional[Callable] = None,
-    tesseract_path: Optional[str] = None
-) -> ExtractionResult:
-    """
-    Extract text using the most appropriate method based on PDF characteristics.
-    
-    Args:
-        pdf_path: Path to the PDF file
-        ocr_lang: Tesseract language code (default: "guj" for Gujarati)
-        force_ocr: Whether to force OCR even for digital PDFs
-        progress_callback: Optional callback function to report progress
-        tesseract_path: Optional path to tesseract executable
-    
-    Returns:
-        ExtractionResult object
-    """
-    # Configure tesseract path if provided
-    if tesseract_path:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_path
-    
-    try:
-        # Determine if the PDF is scanned
-        if force_ocr:
-            is_scanned = True
-        else:
-            if progress_callback:
-                progress_callback(0, 1, "Analyzing PDF type...")
-            
-            is_scanned = is_scanned_pdf(pdf_path)
-        
-        # Choose extraction method based on PDF type
-        if is_scanned:
-            logger.info("PDF appears to be scanned or has low text content, using OCR")
-            if progress_callback:
-                progress_callback(0, 1, "PDF appears to be scanned, using OCR...")
-            
-            return _extract_with_ocr(
-                pdf_path,
-                total_pages=0,  # Will be determined during extraction
-                progress_callback=progress_callback,
-                ocr_lang=ocr_lang
-            )
-        else:
-            logger.info("PDF appears to be digital, using text extraction")
-            if progress_callback:
-                progress_callback(0, 1, "PDF appears to be digital, extracting text...")
-            
-            return extract_text_from_pdf(
-                pdf_path,
-                ocr_lang=ocr_lang,
-                progress_callback=progress_callback,
-                tesseract_path=tesseract_path
-            )
-    
-    except Exception as e:
-        logger.error(f"Error in extract_text_with_best_method: {str(e)}")
-        raise ExtractionError(f"Text extraction failed: {str(e)}")
-
-def extract_text_from_bytes(
-    pdf_bytes: bytes,
-    ocr_lang: str = "guj",
-    progress_callback: Optional[Callable] = None,
-    tesseract_path: Optional[str] = None
-) -> ExtractionResult:
-    """
-    Extract text from PDF bytes.
-    
-    Args:
-        pdf_bytes: PDF file content as bytes
-        ocr_lang: Tesseract language code (default: "guj" for Gujarati)
-        progress_callback: Optional callback function to report progress
-        tesseract_path: Optional path to tesseract executable
-    
-    Returns:
-        ExtractionResult object
-    """
-    # Save bytes to a temporary file
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
-        tmp_path = tmp_file.name
-        tmp_file.write(pdf_bytes)
-    
-    try:
-        # Extract text from the temporary file
-        result = extract_text_with_best_method(
-            tmp_path,
-            ocr_lang=ocr_lang,
-            progress_callback=progress_callback,
-            tesseract_path=tesseract_path
-        )
-        return result
-    
-    finally:
-        # Clean up the temporary file
-        try:
-            os.unlink(tmp_path)
         except Exception as e:
-            logger.warning(f"Failed to delete temporary file {tmp_path}: {str(e)}")
+            logger.error(f"Extraction failed for {file_path}: {str(e)}")
+            raise ExtractionError(f"PDF extraction failed: {str(e)}")
+    
+    def _extract_with_pdfplumber(self, file_path: str) -> Dict[str, Any]:
+        """
+        Extract text using pdfplumber (best for selectable text).
+        
+        Args:
+            file_path (str): Path to the PDF file
+            
+        Returns:
+            dict: Extraction result
+        """
+        pages_data = []
+        raw_text = ""
+        
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    # Extract text with basic structure
+                    page_text = page.extract_text() or ""
+                    
+                    # Extract tables if any
+                    tables = page.extract_tables()
+                    
+                    # Get page dimensions
+                    page_info = {
+                        'page_number': page_num,
+                        'text': page_text,
+                        'tables': tables,
+                        'bbox': page.bbox,
+                        'width': page.width,
+                        'height': page.height
+                    }
+                    
+                    pages_data.append(page_info)
+                    raw_text += page_text + "\n\n"
+                
+                # Extract metadata
+                metadata = {
+                    'page_count': len(pdf.pages),
+                    'metadata': pdf.metadata or {},
+                    'file_size': os.path.getsize(file_path)
+                }
+                
+        except Exception as e:
+            logger.error(f"pdfplumber extraction failed: {str(e)}")
+            raise ExtractionError(f"pdfplumber extraction failed: {str(e)}")
+        
+        return {
+            'raw_text': raw_text.strip(),
+            'pages': pages_data,
+            'metadata': metadata,
+            'extraction_method': 'pdfplumber'
+        }
+    
+    def _extract_with_ocr(self, file_path: str) -> Dict[str, Any]:
+        """
+        Extract text using OCR (for scanned PDFs).
+        
+        Args:
+            file_path (str): Path to the PDF file
+            
+        Returns:
+            dict: Extraction result
+        """
+        pages_data = []
+        raw_text = ""
+        
+        try:
+            # Convert PDF to images
+            logger.info("Converting PDF to images for OCR")
+            images = convert_from_path(file_path, dpi=200)
+            
+            for page_num, image in enumerate(images, 1):
+                logger.info(f"Processing OCR for page {page_num}")
+                
+                # Perform OCR on the image
+                page_text = pytesseract.image_to_string(
+                    image, 
+                    config=self.tesseract_config
+                )
+                
+                # Get image dimensions
+                page_info = {
+                    'page_number': page_num,
+                    'text': page_text,
+                    'tables': [],  # OCR doesn't extract tables
+                    'bbox': None,
+                    'width': image.width,
+                    'height': image.height
+                }
+                
+                pages_data.append(page_info)
+                raw_text += page_text + "\n\n"
+            
+            # Basic metadata
+            metadata = {
+                'page_count': len(images),
+                'metadata': {},
+                'file_size': os.path.getsize(file_path)
+            }
+            
+        except Exception as e:
+            logger.error(f"OCR extraction failed: {str(e)}")
+            raise ExtractionError(f"OCR extraction failed: {str(e)}")
+        
+        return {
+            'raw_text': raw_text.strip(),
+            'pages': pages_data,
+            'metadata': metadata,
+            'extraction_method': 'ocr'
+        }
+    
+    def _extract_with_pypdf2_fallback(self, file_path: str) -> Dict[str, Any]:
+        """
+        Fallback extraction using PyPDF2 (basic text extraction).
+        
+        Args:
+            file_path (str): Path to the PDF file
+            
+        Returns:
+            dict: Extraction result
+        """
+        pages_data = []
+        raw_text = ""
+        
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                for page_num, page in enumerate(pdf_reader.pages, 1):
+                    page_text = page.extract_text()
+                    
+                    page_info = {
+                        'page_number': page_num,
+                        'text': page_text,
+                        'tables': [],
+                        'bbox': None,
+                        'width': None,
+                        'height': None
+                    }
+                    
+                    pages_data.append(page_info)
+                    raw_text += page_text + "\n\n"
+                
+                # Basic metadata
+                metadata = {
+                    'page_count': len(pdf_reader.pages),
+                    'metadata': pdf_reader.metadata or {},
+                    'file_size': os.path.getsize(file_path)
+                }
+                
+        except Exception as e:
+            logger.error(f"PyPDF2 fallback extraction failed: {str(e)}")
+            raise ExtractionError(f"PyPDF2 fallback extraction failed: {str(e)}")
+        
+        return {
+            'raw_text': raw_text.strip(),
+            'pages': pages_data,
+            'metadata': metadata,
+            'extraction_method': 'pypdf2'
+        }
+    
+    def _generate_structured_html(self, extraction_result: Dict[str, Any]) -> str:
+        """
+        Generate structured HTML from extraction result.
+        
+        Args:
+            extraction_result (dict): Result from extraction
+            
+        Returns:
+            str: Structured HTML
+        """
+        html_parts = [
+            '<!DOCTYPE html>',
+            '<html lang="gu">',
+            '<head>',
+            '    <meta charset="UTF-8">',
+            '    <meta name="viewport" content="width=device-width, initial-scale=1.0">',
+            '    <title>Extracted Legal Document</title>',
+            '    <style>',
+            '        body { font-family: "Noto Sans Gujarati", Arial, sans-serif; line-height: 1.6; margin: 40px; }',
+            '        .page { margin-bottom: 40px; page-break-after: always; }',
+            '        .page-header { font-weight: bold; color: #666; margin-bottom: 20px; }',
+            '        .paragraph { margin-bottom: 15px; text-align: justify; }',
+            '        .table { border-collapse: collapse; width: 100%; margin: 20px 0; }',
+            '        .table th, .table td { border: 1px solid #ddd; padding: 8px; text-align: left; }',
+            '        .table th { background-color: #f2f2f2; }',
+            '    </style>',
+            '</head>',
+            '<body>'
+        ]
+        
+        # Add content for each page
+        for page in extraction_result['pages']:
+            html_parts.append(f'<div class="page">')
+            html_parts.append(f'<div class="page-header">પૃષ્ઠ {page["page_number"]}</div>')
+            
+            # Process text into paragraphs
+            page_text = page['text'].strip()
+            if page_text:
+                paragraphs = page_text.split('\n\n')
+                for para in paragraphs:
+                    para = para.strip()
+                    if para:
+                        # Simple cleanup
+                        para = para.replace('\n', ' ').replace('  ', ' ')
+                        html_parts.append(f'<div class="paragraph">{self._escape_html(para)}</div>')
+            
+            # Add tables if any
+            if page.get('tables'):
+                for table in page['tables']:
+                    if table and len(table) > 0:
+                        html_parts.append('<table class="table">')
+                        for row_idx, row in enumerate(table):
+                            if row and any(cell for cell in row if cell):  # Skip empty rows
+                                tag = 'th' if row_idx == 0 else 'td'
+                                html_parts.append('<tr>')
+                                for cell in row:
+                                    cell_content = self._escape_html(str(cell or ''))
+                                    html_parts.append(f'<{tag}>{cell_content}</{tag}>')
+                                html_parts.append('</tr>')
+                        html_parts.append('</table>')
+            
+            html_parts.append('</div>')
+        
+        html_parts.extend(['</body>', '</html>'])
+        
+        return '\n'.join(html_parts)
+    
+    def _escape_html(self, text: str) -> str:
+        """Escape HTML special characters."""
+        if not text:
+            return ""
+        return (text.replace('&', '&amp;')
+                   .replace('<', '&lt;')
+                   .replace('>', '&gt;')
+                   .replace('"', '&quot;')
+                   .replace("'", '&#39;'))
+    
+    def get_text_chunks(self, extraction_result: Dict[str, Any], max_chunk_size: int = 1000) -> List[str]:
+        """
+        Split extracted text into chunks suitable for translation.
+        
+        Args:
+            extraction_result (dict): Result from extraction
+            max_chunk_size (int): Maximum characters per chunk
+            
+        Returns:
+            list: List of text chunks
+        """
+        raw_text = extraction_result['raw_text']
+        if not raw_text:
+            return []
+        
+        chunks = []
+        current_chunk = ""
+        
+        # Split by sentences/paragraphs
+        sentences = raw_text.replace('\n\n', '\n').split('\n')
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            # If adding this sentence would exceed the limit
+            if len(current_chunk) + len(sentence) + 1 > max_chunk_size:
+                # Add current chunk if it has content
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+                
+                # Start new chunk
+                if len(sentence) > max_chunk_size:
+                    # Split very long sentences
+                    words = sentence.split()
+                    temp_chunk = ""
+                    for word in words:
+                        if len(temp_chunk) + len(word) + 1 > max_chunk_size:
+                            if temp_chunk.strip():
+                                chunks.append(temp_chunk.strip())
+                            temp_chunk = word
+                        else:
+                            temp_chunk += " " + word if temp_chunk else word
+                    current_chunk = temp_chunk
+                else:
+                    current_chunk = sentence
+            else:
+                current_chunk += "\n" + sentence if current_chunk else sentence
+        
+        # Add the last chunk
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+
+def create_extractor(tesseract_path: Optional[str] = None) -> PDFExtractor:
+    """
+    Factory function to create a PDF extractor instance.
+    
+    Args:
+        tesseract_path (str, optional): Path to Tesseract executable
+        
+    Returns:
+        PDFExtractor: Configured extractor instance
+    """
+    return PDFExtractor(tesseract_path)

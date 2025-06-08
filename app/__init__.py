@@ -164,6 +164,13 @@ def register_blueprints(app):
         app.logger.info("Registered download blueprint")
     except ImportError:
         app.logger.warning("Download blueprint not found or failed to load")
+    
+        try:
+        from app.routes.health import health_bp
+        app.register_blueprint(health_bp)
+        app.logger.info("Registered health blueprint")
+    except ImportError:
+        app.logger.warning("Health blueprint not found or failed to load")
 
 def register_error_handlers(app):
     """
@@ -208,3 +215,4 @@ def register_error_handlers(app):
             "error": "Server Error",
             "message": "An unexpected error occurred. Please try again later."
         }), 500
+
