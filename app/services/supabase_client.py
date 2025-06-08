@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
-from storage3 import StorageException
+from storage3.utils import StorageException
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -308,7 +308,8 @@ class SupabaseClient:
             SupabaseClientError: If the operation fails
         """
         try:
-            result = self.client.storage.from_(bucket).create_signed_upload_url(path, expires_in)
+            # The create_signed_upload_url method only takes the path and optional expires_in
+            result = self.client.storage.from_(bucket).create_signed_upload_url(path)
             
             return {
                 "signed_url": result["signed_url"],

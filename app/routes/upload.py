@@ -32,10 +32,7 @@ def get_supabase_client() -> SupabaseClient:
     if not hasattr(current_app, 'supabase') or current_app.supabase is None:
         raise SupabaseClientError("Supabase client not initialized")
     
-    return SupabaseClient(
-        current_app.config['SUPABASE_URL'],
-        current_app.config['SUPABASE_SERVICE_KEY']
-    )
+    return current_app.supabase
 
 @upload_bp.route('/signed-url', methods=['POST'])
 def get_upload_signed_url():

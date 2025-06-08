@@ -12,6 +12,7 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from app.services.supabase_client import SupabaseClient, SupabaseClientError
 
 # Load environment variables
 load_dotenv()
@@ -60,22 +61,23 @@ def create_app(test_config=None):
     CORS(app, resources={r"/*": {"origins": allowed_origins}})
     
     # Initialize Supabase client
-    @app.before_first_request
-    def init_supabase():
-        """Initialize Supabase client before first request."""
-        if not app.config['SUPABASE_URL'] or not app.config['SUPABASE_SERVICE_KEY']:
-            app.logger.warning("Supabase credentials not set. Storage and database features will not work.")
+    if not app.config['SUPABASE_URL'] or not app.config['SUPABASE_SERVICE_KEY']:
+        app.logger.warning("Supabase credentials not set. Storage and database features will not work.")
+        app.supabase = None
+    else:
+        try:
+            # Use our custom SupabaseClient wrapper
+            app.supabase = SupabaseClient(
+                app.config['SUPABASE_URL'],
+                app.config['SUPABASE_SERVICE_KEY']
+            )
+            app.logger.info("Supabase client initialized successfully.")
+        except SupabaseClientError as e:
+            app.logger.error(f"Failed to initialize Supabase client: {str(e)}")
             app.supabase = None
-        else:
-            try:
-                app.supabase = create_client(
-                    app.config['SUPABASE_URL'],
-                    app.config['SUPABASE_SERVICE_KEY']
-                )
-                app.logger.info("Supabase client initialized successfully.")
-            except Exception as e:
-                app.logger.error(f"Failed to initialize Supabase client: {str(e)}")
-                app.supabase = None
+        except Exception as e:
+            app.logger.error(f"Failed to initialize Supabase client: {str(e)}")
+            app.supabase = None
     
     # Configure logging
     configure_logging(app)
@@ -165,7 +167,7 @@ def register_blueprints(app):
     except ImportError:
         app.logger.warning("Download blueprint not found or failed to load")
     
-        try:
+    try:
         from app.routes.health import health_bp
         app.register_blueprint(health_bp)
         app.logger.info("Registered health blueprint")

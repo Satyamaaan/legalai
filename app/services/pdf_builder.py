@@ -14,7 +14,6 @@ from datetime import datetime
 from pathlib import Path
 
 from weasyprint import HTML, CSS
-from weasyprint.fonts import FontConfiguration
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +28,8 @@ class PDFBuilder:
     
     def __init__(self):
         """Initialize the PDF builder."""
-        self.font_config = FontConfiguration()
+        # FontConfiguration is no longer needed in WeasyPrint 60+
+        # Font handling is now automatic
         
         # Default CSS for PDF styling
         self.default_css = """
@@ -378,13 +378,12 @@ class PDFBuilder:
             
             # Create HTML and CSS objects
             html_doc = HTML(string=html_content)
-            css_doc = CSS(string=css_content, font_config=self.font_config)
+            css_doc = CSS(string=css_content)
             
-            # Generate PDF
+            # Generate PDF (font handling is automatic in WeasyPrint 60+)
             html_doc.write_pdf(
                 output_path,
-                stylesheets=[css_doc],
-                font_config=self.font_config
+                stylesheets=[css_doc]
             )
             
         except Exception as e:
